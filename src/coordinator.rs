@@ -1,3 +1,4 @@
+use crate::audit::AuditManager;
 use crate::nvml_api::{GpuProc, GpuSnapshot};
 use anyhow::Result;
 use axum::{
@@ -91,26 +92,24 @@ pub struct UserUsage {
 }
 
 /// Coordinator state
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CoordinatorState {
     pub nodes: Arc<RwLock<HashMap<String, NodeInfo>>>,
     pub snapshots: Arc<RwLock<HashMap<String, NodeSnapshot>>>,
     pub last_cluster_snapshot: Arc<RwLock<Option<ClusterSnapshot>>>,
-}
-
-impl Default for CoordinatorState {
-    fn default() -> Self {
-        Self::new()
-    }
+    /// Shared audit manager — persists cluster node records for temporal rogue detection.
+    pub audit_manager: Arc<AuditManager>,
 }
 
 impl CoordinatorState {
-    pub fn new() -> Self {
-        Self {
+    pub async fn new() -> Result<Self> {
+        let audit_manager = AuditManager::new().await?;
+        Ok(Self {
             nodes: Arc::new(RwLock::new(HashMap::new())),
             snapshots: Arc::new(RwLock::new(HashMap::new())),
             last_cluster_snapshot: Arc::new(RwLock::new(None)),
-        }
+            audit_manager: Arc::new(audit_manager),
+        })
     }
 
     /// Start background tasks for cluster management
@@ -141,19 +140,32 @@ impl CoordinatorState {
         Ok(())
     }
 
-    /// Update node snapshot
+    /// Update node snapshot, persisting records to the audit log for temporal rogue detection.
     pub async fn update_snapshot(&self, node_id: String, snapshot: NodeSnapshot) -> Result<()> {
-        // Update node last seen
+        // Update node last seen and preserve the reported status
         {
             let mut nodes = self.nodes.write().await;
             let node = nodes
                 .get_mut(&node_id)
                 .ok_or_else(|| anyhow::anyhow!("Node {} is not registered", node_id))?;
             node.last_seen = Utc::now();
-            node.status = NodeStatus::Online;
+            node.status = snapshot.status.clone();
         }
 
-        // Store snapshot
+        // Persist snapshot records to audit log so historical rogue detection works.
+        // Convert each process into an AuditRecord with node_id set.
+        {
+            let records = snapshots_to_audit_records(&[snapshot.clone()]);
+            if let Err(e) = self.audit_manager.append_records_pub(&records).await {
+                tracing::warn!(
+                    "Failed to persist cluster audit records for node {}: {}",
+                    node_id,
+                    e
+                );
+            }
+        }
+
+        // Store latest snapshot (for contention / cluster view)
         {
             let mut snapshots = self.snapshots.write().await;
             snapshots.insert(node_id.clone(), snapshot);
@@ -493,26 +505,21 @@ pub(crate) fn snapshots_to_audit_records(
     records
 }
 
-/// Get rogue activity analysis from cluster snapshots (all registered nodes).
-/// Uses current in-memory snapshots so worker-node rogue activity is included.
+/// Get rogue activity analysis using the full audit history from all cluster nodes.
+/// Nodes persist their snapshots into the coordinator's shared AuditManager so temporal
+/// heuristics (long-running, averaging) work correctly across the cluster.
 async fn get_rogue_analysis(
     State(state): State<CoordinatorState>,
 ) -> Result<Json<crate::rogue_detection::RogueDetectionResult>, StatusCode> {
-    use crate::audit::AuditManager;
     use crate::rogue_detection::RogueDetector;
 
-    let snapshots = state.snapshots.read().await;
-    let snapshot_list: Vec<NodeSnapshot> = snapshots.values().cloned().collect();
-    drop(snapshots);
-
-    let records = snapshots_to_audit_records(&snapshot_list);
-
-    let audit_manager = AuditManager::new()
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    // Clone the Arc so the detector owns a reference to the shared audit manager.
+    let audit_manager = (*state.audit_manager).clone();
     let detector = RogueDetector::new(audit_manager);
+
+    // Query the last 24 hours of history — enables LongRunning and averaged-utilization detection.
     let result = detector
-        .detect_rogue_activity_from_records(records)
+        .detect_rogue_activity(24)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
@@ -820,7 +827,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_contention_analysis_gpu_count_unique() {
-        let state = CoordinatorState::new();
+        let state = CoordinatorState::new().await.unwrap();
 
         // Scenario: User "alice" has 2 processes on GPU 0
         // Expected: gpu_count should be 1 (alice is using 1 unique GPU)
@@ -907,7 +914,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_contention_analysis_multi_gpu_multi_node() {
-        let state = CoordinatorState::new();
+        let state = CoordinatorState::new().await.unwrap();
 
         // Scenario: User "bob" has processes on GPU 0 and GPU 1 across two nodes
         // Expected: gpu_count should be 4 (2 GPUs per node × 2 nodes)
@@ -1094,7 +1101,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_contention_analysis_avg_utilization_unique_gpus() {
-        let state = CoordinatorState::new();
+        let state = CoordinatorState::new().await.unwrap();
 
         let snapshot = NodeSnapshot {
             node_id: "test-node".to_string(),
@@ -1203,7 +1210,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_snapshot_rejected_for_unregistered_node() {
-        let state = CoordinatorState::new();
+        let state = CoordinatorState::new().await.unwrap();
 
         let snapshot = NodeSnapshot {
             node_id: "rogue-node".to_string(),

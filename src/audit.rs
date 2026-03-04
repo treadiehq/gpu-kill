@@ -37,6 +37,7 @@ pub struct AuditSummary {
 }
 
 /// Audit manager for GPU usage tracking
+#[derive(Clone)]
 pub struct AuditManager {
     data_dir: PathBuf,
 }
@@ -133,6 +134,11 @@ impl AuditManager {
         // Append records to JSON file
         self.append_records(&records).await?;
         Ok(())
+    }
+
+    /// Public wrapper for appending pre-built records (e.g. from cluster coordinator).
+    pub async fn append_records_pub(&self, records: &[AuditRecord]) -> Result<()> {
+        self.append_records(records).await
     }
 
     /// Append records to JSON file

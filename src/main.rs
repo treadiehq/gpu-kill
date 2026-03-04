@@ -1042,7 +1042,9 @@ async fn execute_server_operation(host: String, port: u16, gpu_manager: GpuManag
     info!("Starting GPU Kill Coordinator Server on {}:{}", host, port);
 
     // Initialize coordinator state
-    let state = CoordinatorState::new();
+    let state = CoordinatorState::new()
+        .await
+        .context("Failed to initialize coordinator audit manager")?;
 
     // Start background tasks for cluster management
     state.start_background_tasks();
