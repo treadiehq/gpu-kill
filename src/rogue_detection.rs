@@ -315,6 +315,7 @@ impl RogueDetector {
 
     /// Analyze a provided list of audit records (e.g. from cluster snapshots) for rogue activity.
     /// Does not query the audit manager; use this for cluster-wide analysis.
+    #[allow(dead_code)]
     pub async fn detect_rogue_activity_from_records(
         &self,
         records: Vec<AuditRecord>,
