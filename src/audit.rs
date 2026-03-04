@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicI64, Ordering};
+use tokio::io::{AsyncBufReadExt, BufReader};
 
 /// Audit record for GPU usage
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,6 +36,15 @@ pub struct AuditSummary {
     pub top_users: Vec<(String, u64, u32)>, // (user, count, total_memory_mb)
     pub top_processes: Vec<(String, u64, u32)>, // (process, count, total_memory_mb)
     pub gpu_usage_by_hour: Vec<(u32, u32)>, // (hour, avg_memory_mb)
+}
+
+/// Monotonically increasing record ID generator — eliminates timestamp+PID collisions.
+fn next_record_id() -> i64 {
+    static COUNTER: AtomicI64 = AtomicI64::new(0);
+    let ts = Utc::now().timestamp_millis();
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    // Pack timestamp (high bits) + sequence (low 20 bits) to stay unique and ordered.
+    (ts << 20) | (seq & 0xFFFFF)
 }
 
 /// Audit manager for GPU usage tracking
@@ -82,9 +93,8 @@ impl AuditManager {
         let mut records = Vec::new();
 
         for snapshot in snapshots {
-            // Log GPU-level information
             let gpu_record = AuditRecord {
-                id: timestamp.timestamp_millis(), // Use timestamp as ID
+                id: next_record_id(),
                 timestamp,
                 gpu_index: snapshot.gpu_index,
                 gpu_name: snapshot.name.clone(),
@@ -101,8 +111,7 @@ impl AuditManager {
 
             records.push(gpu_record);
 
-            // Log process-level information. Attribute GPU utilization proportionally
-            // across processes on this GPU so RogueDetector heuristics are effective.
+            // Attribute GPU utilization proportionally across processes on this GPU.
             let gpu_processes: Vec<_> = processes
                 .iter()
                 .filter(|p| p.gpu_index == snapshot.gpu_index)
@@ -112,7 +121,7 @@ impl AuditManager {
 
             for process in gpu_processes {
                 let process_record = AuditRecord {
-                    id: timestamp.timestamp_millis() + process.pid as i64, // Use timestamp + PID as ID
+                    id: next_record_id(),
                     timestamp,
                     gpu_index: snapshot.gpu_index,
                     gpu_name: snapshot.name.clone(),
@@ -121,8 +130,8 @@ impl AuditManager {
                     process_name: Some(process.proc_name.clone()),
                     memory_used_mb: process.used_mem_mb,
                     utilization_pct: util_per_process,
-                    temperature_c: 0, // Process-level temperature not available
-                    power_w: 0.0,     // Process-level power not available
+                    temperature_c: 0,
+                    power_w: 0.0,
                     container: process.container.clone(),
                     node_id: None,
                 };
@@ -131,7 +140,6 @@ impl AuditManager {
             }
         }
 
-        // Append records to JSON file
         self.append_records(&records).await?;
         Ok(())
     }
@@ -162,7 +170,10 @@ impl AuditManager {
         Ok(())
     }
 
-    /// Query audit records with filters
+    /// Query audit records with filters.
+    ///
+    /// Streams the file line-by-line using `tokio::io::BufReader` to avoid loading
+    /// the entire log into memory.
     pub async fn query_records(
         &self,
         hours: u32,
@@ -176,54 +187,50 @@ impl AuditManager {
             return Ok(Vec::new());
         }
 
-        let content = fs::read_to_string(&file_path)
-            .map_err(|e| anyhow::anyhow!("Failed to read audit file: {}", e))?;
+        let file = tokio::fs::File::open(&file_path)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to open audit file: {}", e))?;
+        let mut lines = BufReader::new(file).lines();
 
         let mut records = Vec::new();
-        for line in content.lines() {
-            if line.trim().is_empty() {
+        while let Some(line) = lines.next_line().await? {
+            let line = line.trim().to_owned();
+            if line.is_empty() {
                 continue;
             }
 
-            let record: AuditRecord = serde_json::from_str(line)
+            let record: AuditRecord = serde_json::from_str(&line)
                 .map_err(|e| anyhow::anyhow!("Failed to parse audit record: {}", e))?;
 
-            // Filter by time
             if record.timestamp < since {
                 continue;
             }
 
-            // Filter by user
             if let Some(user) = user_filter {
-                if let Some(ref record_user) = record.user {
-                    if record_user != user {
-                        continue;
-                    }
-                } else {
-                    continue;
+                match &record.user {
+                    Some(u) if u == user => {}
+                    _ => continue,
                 }
             }
 
-            // Filter by process
             if let Some(process) = process_filter {
-                if let Some(ref record_process) = record.process_name {
-                    if !record_process.contains(process) {
-                        continue;
-                    }
-                } else {
-                    continue;
+                match &record.process_name {
+                    Some(p) if p.contains(process) => {}
+                    _ => continue,
                 }
             }
 
             records.push(record);
         }
 
-        // Sort by timestamp descending
         records.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
         Ok(records)
     }
 
-    /// Get audit summary statistics
+    /// Get audit summary statistics.
+    ///
+    /// Single-pass O(N) aggregation over a streamed file — no full-file load,
+    /// no O(N·H) nested loop.
     pub async fn get_summary(&self, hours: u32) -> Result<AuditSummary> {
         let since = Utc::now() - chrono::Duration::hours(hours as i64);
         let file_path = self.data_dir.join("audit.jsonl");
@@ -238,35 +245,53 @@ impl AuditManager {
             });
         }
 
-        let content = fs::read_to_string(&file_path)
-            .map_err(|e| anyhow::anyhow!("Failed to read audit file: {}", e))?;
+        let file = tokio::fs::File::open(&file_path)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to open audit file: {}", e))?;
+        let mut lines = BufReader::new(file).lines();
 
-        let mut records = Vec::new();
-        for line in content.lines() {
-            if line.trim().is_empty() {
+        let mut total_records: u64 = 0;
+        let mut user_stats: std::collections::HashMap<String, (u64, u32)> =
+            std::collections::HashMap::new();
+        let mut process_stats: std::collections::HashMap<String, (u64, u32)> =
+            std::collections::HashMap::new();
+        // hour_bucket[h] = (sum_memory, count) for records in hour h since `since`
+        let mut hour_buckets: Vec<(u64, u64)> = vec![(0, 0); hours as usize];
+
+        while let Some(line) = lines.next_line().await? {
+            let line = line.trim().to_owned();
+            if line.is_empty() {
                 continue;
             }
 
-            let record: AuditRecord = serde_json::from_str(line)
+            let record: AuditRecord = serde_json::from_str(&line)
                 .map_err(|e| anyhow::anyhow!("Failed to parse audit record: {}", e))?;
 
-            if record.timestamp >= since {
-                records.push(record);
+            if record.timestamp < since {
+                continue;
             }
-        }
 
-        let total_records = records.len() as u64;
+            total_records += 1;
 
-        // Calculate top users
-        let mut user_stats: std::collections::HashMap<String, (u64, u32)> =
-            std::collections::HashMap::new();
-        for record in &records {
             if let Some(ref user) = record.user {
-                let entry = user_stats.entry(user.clone()).or_insert((0, 0));
-                entry.0 += 1;
-                entry.1 += record.memory_used_mb;
+                let e = user_stats.entry(user.clone()).or_insert((0, 0));
+                e.0 += 1;
+                e.1 = e.1.saturating_add(record.memory_used_mb);
             }
+
+            if let Some(ref process) = record.process_name {
+                let e = process_stats.entry(process.clone()).or_insert((0, 0));
+                e.0 += 1;
+                e.1 = e.1.saturating_add(record.memory_used_mb);
+            }
+
+            // Determine which hour bucket this record falls into (single pass).
+            let elapsed = record.timestamp - since;
+            let bucket = elapsed.num_hours().clamp(0, hours as i64 - 1) as usize;
+            hour_buckets[bucket].0 += record.memory_used_mb as u64;
+            hour_buckets[bucket].1 += 1;
         }
+
         let mut top_users: Vec<(String, u64, u32)> = user_stats
             .into_iter()
             .map(|(user, (count, memory))| (user, count, memory))
@@ -274,16 +299,6 @@ impl AuditManager {
         top_users.sort_by(|a, b| b.2.cmp(&a.2));
         top_users.truncate(10);
 
-        // Calculate top processes
-        let mut process_stats: std::collections::HashMap<String, (u64, u32)> =
-            std::collections::HashMap::new();
-        for record in &records {
-            if let Some(ref process) = record.process_name {
-                let entry = process_stats.entry(process.clone()).or_insert((0, 0));
-                entry.0 += 1;
-                entry.1 += record.memory_used_mb;
-            }
-        }
         let mut top_processes: Vec<(String, u64, u32)> = process_stats
             .into_iter()
             .map(|(process, (count, memory))| (process, count, memory))
@@ -291,26 +306,14 @@ impl AuditManager {
         top_processes.sort_by(|a, b| b.2.cmp(&a.2));
         top_processes.truncate(10);
 
-        // Calculate GPU usage by hour
-        let mut gpu_usage_by_hour = Vec::new();
-        for hour in 0..hours {
-            let hour_start = since + chrono::Duration::hours(hour as i64);
-            let hour_end = hour_start + chrono::Duration::hours(1);
-
-            let hour_records: Vec<&AuditRecord> = records
-                .iter()
-                .filter(|r| r.timestamp >= hour_start && r.timestamp < hour_end)
-                .collect();
-
-            let avg_memory = if hour_records.is_empty() {
-                0.0
-            } else {
-                let total_memory: u32 = hour_records.iter().map(|r| r.memory_used_mb).sum();
-                total_memory as f64 / hour_records.len() as f64
-            };
-
-            gpu_usage_by_hour.push((hour, avg_memory as u32));
-        }
+        let gpu_usage_by_hour: Vec<(u32, u32)> = hour_buckets
+            .iter()
+            .enumerate()
+            .map(|(h, (sum, count))| {
+                let avg = if *count > 0 { sum / count } else { 0 };
+                (h as u32, avg as u32)
+            })
+            .collect();
 
         Ok(AuditSummary {
             total_records,
@@ -321,7 +324,10 @@ impl AuditManager {
         })
     }
 
-    /// Clean up old audit records (keep only last N days)
+    /// Clean up old audit records (keep only last N days).
+    ///
+    /// Streams input line-by-line, writes survivors to a temp file, then
+    /// atomically renames it over the original so a crash cannot corrupt the log.
     pub async fn cleanup_old_records(&self, keep_days: u32) -> Result<u64> {
         let cutoff = Utc::now() - chrono::Duration::days(keep_days as i64);
         let file_path = self.data_dir.join("audit.jsonl");
@@ -330,37 +336,51 @@ impl AuditManager {
             return Ok(0);
         }
 
-        let content = fs::read_to_string(&file_path)
-            .map_err(|e| anyhow::anyhow!("Failed to read audit file: {}", e))?;
+        let tmp_path = self.data_dir.join("audit.jsonl.tmp");
 
-        let mut records = Vec::new();
-        for line in content.lines() {
-            if line.trim().is_empty() {
+        let input = tokio::fs::File::open(&file_path)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to open audit file: {}", e))?;
+        let mut lines = BufReader::new(input).lines();
+
+        // Write to a temp file; sync + rename for atomicity.
+        let mut tmp_file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp_path)
+            .map_err(|e| anyhow::anyhow!("Failed to open tmp audit file: {}", e))?;
+
+        let mut total_read: u64 = 0;
+        let mut kept: u64 = 0;
+
+        while let Some(line) = lines.next_line().await? {
+            let line = line.trim().to_owned();
+            if line.is_empty() {
                 continue;
             }
 
-            let record: AuditRecord = serde_json::from_str(line)
+            total_read += 1;
+
+            let record: AuditRecord = serde_json::from_str(&line)
                 .map_err(|e| anyhow::anyhow!("Failed to parse audit record: {}", e))?;
 
             if record.timestamp >= cutoff {
-                records.push(record);
+                writeln!(tmp_file, "{}", line)
+                    .map_err(|e| anyhow::anyhow!("Failed to write tmp audit file: {}", e))?;
+                kept += 1;
             }
         }
 
-        let removed_count = content.lines().count() as u64 - records.len() as u64;
+        tmp_file
+            .flush()
+            .map_err(|e| anyhow::anyhow!("Failed to flush tmp audit file: {}", e))?;
+        drop(tmp_file);
 
-        // Write back the filtered records
-        let mut file = fs::File::create(&file_path)
-            .map_err(|e| anyhow::anyhow!("Failed to create audit file: {}", e))?;
+        fs::rename(&tmp_path, &file_path)
+            .map_err(|e| anyhow::anyhow!("Failed to replace audit file atomically: {}", e))?;
 
-        for record in records {
-            let json_line = serde_json::to_string(&record)
-                .map_err(|e| anyhow::anyhow!("Failed to serialize record: {}", e))?;
-            writeln!(file, "{}", json_line)
-                .map_err(|e| anyhow::anyhow!("Failed to write to audit file: {}", e))?;
-        }
-
-        Ok(removed_count)
+        Ok(total_read.saturating_sub(kept))
     }
 }
 

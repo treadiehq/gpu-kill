@@ -33,10 +33,12 @@ pub struct GpuInstanceConfig {
 pub struct GpuInstance {
     /// Unique instance ID
     pub id: String,
-    /// Instance IP address
-    pub ip_address: String,
-    /// SSH connection details
-    pub ssh_config: SshConfig,
+    /// Instance IP address — absent while the instance is still provisioning.
+    #[serde(default)]
+    pub ip_address: Option<String>,
+    /// SSH connection details — absent while the instance is still provisioning.
+    #[serde(default)]
+    pub ssh_config: Option<SshConfig>,
     /// GPU type
     pub gpu_type: String,
     /// Instance status
@@ -52,10 +54,15 @@ pub struct GpuInstance {
 pub struct SshConfig {
     /// SSH username
     pub username: String,
-    /// SSH port (default: 22)
+    /// SSH port — defaults to 22 when the API omits the field.
+    #[serde(default = "default_ssh_port")]
     pub port: u16,
     /// SSH key path or content
     pub key_path: Option<String>,
+}
+
+fn default_ssh_port() -> u16 {
+    22
 }
 
 /// Test results from GPU instance
@@ -290,5 +297,48 @@ mod tests {
 
         assert_eq!(config.gpu_type, "nvidia");
         assert_eq!(config.duration_minutes, 30);
+    }
+
+    #[test]
+    fn test_ssh_config_defaults_port_when_missing() {
+        let json = r#"{"username": "root", "key_path": "/path/to/key"}"#;
+        let config: SshConfig = serde_json::from_str(json)
+            .expect("SshConfig should deserialize with port defaulting to 22");
+        assert_eq!(config.port, 22);
+        assert_eq!(config.username, "root");
+    }
+
+    #[test]
+    fn test_gpu_instance_deserializes_without_ip_or_ssh() {
+        let json = r#"{
+            "id": "inst-123",
+            "gpu_type": "nvidia",
+            "status": "provisioning",
+            "created_at": "2023-01-01T00:00:00Z",
+            "expires_at": "2023-01-01T01:00:00Z"
+        }"#;
+        let instance: GpuInstance = serde_json::from_str(json).expect(
+            "GpuInstance should deserialize even when ip_address and ssh_config are absent",
+        );
+        assert_eq!(instance.status, "provisioning");
+        assert!(instance.ip_address.is_none());
+        assert!(instance.ssh_config.is_none());
+    }
+
+    #[test]
+    fn test_gpu_instance_deserializes_fully_when_ready() {
+        let json = r#"{
+            "id": "inst-456",
+            "ip_address": "10.0.0.1",
+            "ssh_config": {"username": "ubuntu", "port": 22},
+            "gpu_type": "nvidia",
+            "status": "ready",
+            "created_at": "2023-01-01T00:00:00Z",
+            "expires_at": "2023-01-01T01:00:00Z"
+        }"#;
+        let instance: GpuInstance = serde_json::from_str(json)
+            .expect("GpuInstance should deserialize with all fields present");
+        assert_eq!(instance.ip_address.as_deref(), Some("10.0.0.1"));
+        assert_eq!(instance.ssh_config.as_ref().map(|s| s.port), Some(22));
     }
 }
