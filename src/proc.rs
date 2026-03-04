@@ -6,7 +6,9 @@ use nix::sys::signal::{kill, Signal};
 #[cfg(unix)]
 use nix::unistd::Pid;
 // use std::process::Command; // Used conditionally below
-use std::time::{Duration, Instant, SystemTime};
+#[cfg(unix)]
+use std::time::Instant;
+use std::time::{Duration, SystemTime};
 use sysinfo::{Pid as SysPid, System};
 
 /// Process information for a running process
