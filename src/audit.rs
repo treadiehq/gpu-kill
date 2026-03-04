@@ -83,11 +83,15 @@ impl AuditManager {
         Ok(path)
     }
 
-    /// Log GPU usage snapshot
+    /// Log GPU usage snapshot.
+    ///
+    /// `node_id` should be the hostname or cluster node identifier of the machine
+    /// generating this snapshot. Pass `None` when the node identity is unknown.
     pub async fn log_snapshot(
         &self,
         snapshots: &[GpuSnapshot],
         processes: &[GpuProc],
+        node_id: Option<String>,
     ) -> Result<()> {
         let timestamp = Utc::now();
         let mut records = Vec::new();
@@ -106,7 +110,7 @@ impl AuditManager {
                 temperature_c: snapshot.temp_c,
                 power_w: snapshot.power_w,
                 container: None,
-                node_id: None,
+                node_id: node_id.clone(),
             };
 
             records.push(gpu_record);
@@ -133,7 +137,7 @@ impl AuditManager {
                     temperature_c: 0,
                     power_w: 0.0,
                     container: process.container.clone(),
-                    node_id: None,
+                    node_id: node_id.clone(),
                 };
 
                 records.push(process_record);

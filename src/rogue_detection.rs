@@ -339,7 +339,8 @@ impl RogueDetector {
                 .process_name
                 .as_ref()
                 .is_none_or(|p| self.is_process_whitelisted(p));
-            user_ok && process_ok
+            // OR: either a trusted user OR a trusted process is sufficient for exemption.
+            user_ok || process_ok
         })
     }
 
@@ -698,8 +699,11 @@ impl RogueDetector {
 
     /// Check if user is unusual
     fn is_unusual_user(&self, user: &str) -> bool {
-        let unusual_users = ["root", "admin", "system", "daemon", "nobody"];
-        unusual_users.contains(&user.to_lowercase().as_str())
+        // root, admin, system are already in the default user whitelist and should
+        // never be penalised as "unusual". Only flag genuinely low-privilege accounts
+        // that are unlikely to legitimately run GPU workloads.
+        let unusual_users = ["daemon", "nobody"];
+        unusual_users.contains(&user.to_lowercase().as_str()) && !self.is_user_whitelisted(user)
     }
 
     /// Determine risk level based on confidence

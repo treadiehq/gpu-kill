@@ -249,7 +249,10 @@ async fn execute_single_list(
     // Log to audit database (async)
     // Now that execute_single_list is async, we can directly log to audit
     match crate::audit::AuditManager::new().await {
-        Ok(audit_manager) => match audit_manager.log_snapshot(&gpus, &procs).await {
+        Ok(audit_manager) => match audit_manager
+            .log_snapshot(&gpus, &procs, Some(crate::util::get_hostname()))
+            .await
+        {
             Ok(()) => {
                 tracing::debug!(
                     "Successfully logged audit snapshot with {} GPUs and {} processes",
