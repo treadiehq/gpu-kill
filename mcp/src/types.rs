@@ -79,11 +79,13 @@ fn deserialize_request_id<'de, D>(deserializer: D) -> Result<Option<RequestId>, 
 where
     D: serde::Deserializer<'de>,
 {
-    let id = Option::<RequestId>::deserialize(deserializer)?;
-    if matches!(id, Some(RequestId::Null)) {
+    // Deserialize as RequestId directly so an explicit JSON `null` is captured
+    // as RequestId::Null rather than being swallowed as Option::None.
+    let id = RequestId::deserialize(deserializer)?;
+    if matches!(id, RequestId::Null) {
         return Err(serde::de::Error::custom("jsonrpc id must not be null"));
     }
-    Ok(id)
+    Ok(Some(id))
 }
 
 /// MCP Request/Response types
@@ -214,8 +216,11 @@ pub struct Resource {
 #[serde(rename_all = "camelCase")]
 pub struct ResourceContents {
     pub uri: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub mime_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub blob: Option<String>, // Base64 encoded
 }
 
@@ -247,6 +252,7 @@ pub struct ToolResult {
 pub struct ToolContent {
     #[serde(rename = "type")]
     pub content_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<serde_json::Value>,

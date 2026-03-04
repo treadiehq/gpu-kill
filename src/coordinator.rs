@@ -155,7 +155,7 @@ impl CoordinatorState {
         // Persist snapshot records to audit log so historical rogue detection works.
         // Convert each process into an AuditRecord with node_id set.
         {
-            let records = snapshots_to_audit_records(&[snapshot.clone()]);
+            let records = snapshots_to_audit_records(std::slice::from_ref(&snapshot));
             if let Err(e) = self.audit_manager.append_records_pub(&records).await {
                 tracing::warn!(
                     "Failed to persist cluster audit records for node {}: {}",

@@ -93,6 +93,11 @@ impl SshRemote {
             ));
         }
 
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stderr.is_empty() {
+            warn!("SSH command stderr: {}", stderr.trim());
+        }
+
         let stdout = String::from_utf8(output.stdout)
             .context("Failed to decode SSH command output as UTF-8")?;
         debug!(
@@ -151,7 +156,10 @@ impl SshRemote {
         // Add host and command
         cmd.arg(host_spec).arg(command);
 
-        debug!("Running SSH command with sshpass: {:?}", cmd);
+        debug!(
+            "Running SSH command with sshpass (password hidden): ssh -p {} {}",
+            self.config.port, host_spec
+        );
 
         cmd.stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -227,26 +235,14 @@ impl SshRemote {
         }
         ssh_cmd.arg(host_spec).arg(command);
 
-        let mut child = ssh_cmd
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+        ssh_cmd
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
             .stdin(Stdio::null())
             .spawn()
-            .context("Failed to spawn SSH command")?;
-
-        let mut stdout = child.stdout.take().unwrap();
-        let mut stderr = child.stderr.take().unwrap();
-        let mut local_stdout = std::io::stdout();
-        let mut local_stderr = std::io::stderr();
-        std::thread::scope(|s| {
-            s.spawn(|| {
-                let _ = std::io::copy(&mut stdout, &mut local_stdout);
-            });
-            s.spawn(|| {
-                let _ = std::io::copy(&mut stderr, &mut local_stderr);
-            });
-        });
-        child.wait().context("Failed to wait for SSH command")
+            .context("Failed to spawn SSH command")?
+            .wait()
+            .context("Failed to wait for SSH command")
     }
 
     /// Execute command via sshpass and stream stdout/stderr to the local process.
@@ -276,26 +272,13 @@ impl SshRemote {
         }
         cmd.arg(host_spec).arg(command);
 
-        let mut child = cmd
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+        cmd.stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
             .stdin(Stdio::null())
             .spawn()
-            .context("Failed to spawn sshpass command")?;
-
-        let mut stdout = child.stdout.take().unwrap();
-        let mut stderr = child.stderr.take().unwrap();
-        let mut local_stdout = std::io::stdout();
-        let mut local_stderr = std::io::stderr();
-        std::thread::scope(|s| {
-            s.spawn(|| {
-                let _ = std::io::copy(&mut stdout, &mut local_stdout);
-            });
-            s.spawn(|| {
-                let _ = std::io::copy(&mut stderr, &mut local_stderr);
-            });
-        });
-        child.wait().context("Failed to wait for sshpass command")
+            .context("Failed to spawn sshpass command")?
+            .wait()
+            .context("Failed to wait for sshpass command")
     }
 
     /// Execute a command on the remote host and stream output to local stdout/stderr.

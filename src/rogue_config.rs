@@ -397,8 +397,16 @@ impl RogueConfigManager {
         Ok(())
     }
 
-    /// Convert to DetectionRules for backward compatibility
+    /// Convert to DetectionRules, propagating all configured settings.
     pub fn to_detection_rules(&self) -> DetectionRules {
+        use crate::rogue_detection::{
+            CustomPattern as DetCustomPattern, EnabledDetections, RiskThresholds, ThreatWeights,
+        };
+
+        let cfg_en = &self.config.detection.enabled_detections;
+        let cfg_w = &self.config.scoring.threat_weights;
+        let cfg_t = &self.config.scoring.risk_thresholds;
+
         DetectionRules {
             crypto_miner_patterns: self.config.patterns.crypto_miner_patterns.clone(),
             suspicious_process_names: self.config.patterns.suspicious_process_names.clone(),
@@ -408,6 +416,34 @@ impl RogueConfigManager {
             min_confidence_threshold: self.config.detection.min_confidence_threshold,
             user_whitelist: self.config.patterns.user_whitelist.clone(),
             process_whitelist: self.config.patterns.process_whitelist.clone(),
+            enabled_detections: EnabledDetections {
+                crypto_miners: cfg_en.crypto_miners,
+                suspicious_processes: cfg_en.suspicious_processes,
+                resource_abusers: cfg_en.resource_abusers,
+                data_exfiltrators: cfg_en.data_exfiltrators,
+            },
+            threat_weights: ThreatWeights {
+                crypto_miner: cfg_w.crypto_miner,
+                suspicious_process: cfg_w.suspicious_process,
+                resource_abuser: cfg_w.resource_abuser,
+                data_exfiltrator: cfg_w.data_exfiltrator,
+            },
+            risk_thresholds: RiskThresholds {
+                critical: cfg_t.critical,
+                high: cfg_t.high,
+                medium: cfg_t.medium,
+            },
+            custom_patterns: self
+                .config
+                .patterns
+                .custom_patterns
+                .iter()
+                .map(|cp| DetCustomPattern {
+                    name: cp.name.clone(),
+                    pattern: cp.pattern.clone(),
+                    confidence_boost: cp.confidence_boost,
+                })
+                .collect(),
         }
     }
 

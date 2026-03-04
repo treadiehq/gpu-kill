@@ -79,6 +79,72 @@ pub struct RogueDetector {
     detection_rules: DetectionRules,
 }
 
+/// Which detection types are active
+#[derive(Debug, Clone)]
+pub struct EnabledDetections {
+    pub crypto_miners: bool,
+    pub suspicious_processes: bool,
+    pub resource_abusers: bool,
+    pub data_exfiltrators: bool,
+}
+
+impl Default for EnabledDetections {
+    fn default() -> Self {
+        Self {
+            crypto_miners: true,
+            suspicious_processes: true,
+            resource_abusers: true,
+            data_exfiltrators: false,
+        }
+    }
+}
+
+/// Scoring weights for each threat category
+#[derive(Debug, Clone)]
+pub struct ThreatWeights {
+    pub crypto_miner: f32,
+    pub suspicious_process: f32,
+    pub resource_abuser: f32,
+    pub data_exfiltrator: f32,
+}
+
+impl Default for ThreatWeights {
+    fn default() -> Self {
+        Self {
+            crypto_miner: 0.8,
+            suspicious_process: 0.6,
+            resource_abuser: 0.3,
+            data_exfiltrator: 0.9,
+        }
+    }
+}
+
+/// Thresholds mapping confidence → RiskLevel
+#[derive(Debug, Clone)]
+pub struct RiskThresholds {
+    pub critical: f32,
+    pub high: f32,
+    pub medium: f32,
+}
+
+impl Default for RiskThresholds {
+    fn default() -> Self {
+        Self {
+            critical: 0.9,
+            high: 0.7,
+            medium: 0.5,
+        }
+    }
+}
+
+/// A single custom detection pattern carried from config
+#[derive(Debug, Clone)]
+pub struct CustomPattern {
+    pub name: String,
+    pub pattern: String,
+    pub confidence_boost: f32,
+}
+
 /// Configurable detection rules
 #[derive(Debug, Clone)]
 pub struct DetectionRules {
@@ -92,6 +158,14 @@ pub struct DetectionRules {
     pub user_whitelist: Vec<String>,
     /// Processes in this list are exempt from rogue detection
     pub process_whitelist: Vec<String>,
+    /// Which detection categories are active
+    pub enabled_detections: EnabledDetections,
+    /// Scoring weights per threat type
+    pub threat_weights: ThreatWeights,
+    /// Confidence thresholds for risk levels
+    pub risk_thresholds: RiskThresholds,
+    /// User-defined custom patterns applied in suspicious-process detection
+    pub custom_patterns: Vec<CustomPattern>,
 }
 
 impl Default for DetectionRules {
@@ -134,6 +208,10 @@ impl Default for DetectionRules {
                 "pytorch".to_string(),
                 "nvidia-smi".to_string(),
             ],
+            enabled_detections: EnabledDetections::default(),
+            threat_weights: ThreatWeights::default(),
+            risk_thresholds: RiskThresholds::default(),
+            custom_patterns: Vec::new(),
         }
     }
 }
@@ -182,29 +260,31 @@ impl RogueDetector {
         // Group audit records by (node_id, pid) for analysis
         let process_groups = self.group_records_by_pid(&audit_records);
 
+        let en = &self.detection_rules.enabled_detections;
+
         for (_key, records) in process_groups {
-            // Detect crypto miners
-            if let Some(miner) = self.detect_crypto_miner(&records) {
-                crypto_miners.push(miner);
+            if en.crypto_miners {
+                if let Some(miner) = self.detect_crypto_miner(&records) {
+                    crypto_miners.push(miner);
+                }
             }
-
-            // Detect suspicious processes
-            if let Some(suspicious) = self.detect_suspicious_process(&records) {
-                suspicious_processes.push(suspicious);
+            if en.suspicious_processes {
+                if let Some(suspicious) = self.detect_suspicious_process(&records) {
+                    suspicious_processes.push(suspicious);
+                }
             }
-
-            // Detect resource abusers
-            if let Some(abuser) = self.detect_resource_abuser(&records) {
-                resource_abusers.push(abuser);
+            if en.resource_abusers {
+                if let Some(abuser) = self.detect_resource_abuser(&records) {
+                    resource_abusers.push(abuser);
+                }
             }
-
-            // Detect data exfiltrators
-            if let Some(exfiltrator) = self.detect_data_exfiltrator(&records) {
-                data_exfiltrators.push(exfiltrator);
+            if en.data_exfiltrators {
+                if let Some(exfiltrator) = self.detect_data_exfiltrator(&records) {
+                    data_exfiltrators.push(exfiltrator);
+                }
             }
         }
 
-        // Calculate overall risk score
         let risk_score = self.calculate_risk_score(
             &suspicious_processes,
             &crypto_miners,
@@ -212,7 +292,6 @@ impl RogueDetector {
             &data_exfiltrators,
         );
 
-        // Generate recommendations
         let recommendations = self.generate_recommendations(
             &suspicious_processes,
             &crypto_miners,
@@ -252,18 +331,28 @@ impl RogueDetector {
 
         let process_groups = self.group_records_by_pid(&records);
 
+        let en = &self.detection_rules.enabled_detections;
+
         for (_key, group_records) in process_groups {
-            if let Some(miner) = self.detect_crypto_miner(&group_records) {
-                crypto_miners.push(miner);
+            if en.crypto_miners {
+                if let Some(miner) = self.detect_crypto_miner(&group_records) {
+                    crypto_miners.push(miner);
+                }
             }
-            if let Some(suspicious) = self.detect_suspicious_process(&group_records) {
-                suspicious_processes.push(suspicious);
+            if en.suspicious_processes {
+                if let Some(suspicious) = self.detect_suspicious_process(&group_records) {
+                    suspicious_processes.push(suspicious);
+                }
             }
-            if let Some(abuser) = self.detect_resource_abuser(&group_records) {
-                resource_abusers.push(abuser);
+            if en.resource_abusers {
+                if let Some(abuser) = self.detect_resource_abuser(&group_records) {
+                    resource_abusers.push(abuser);
+                }
             }
-            if let Some(exfiltrator) = self.detect_data_exfiltrator(&group_records) {
-                data_exfiltrators.push(exfiltrator);
+            if en.data_exfiltrators {
+                if let Some(exfiltrator) = self.detect_data_exfiltrator(&group_records) {
+                    data_exfiltrators.push(exfiltrator);
+                }
             }
         }
 
@@ -498,6 +587,25 @@ impl RogueDetector {
 
         let representative = &records[representative_idx];
 
+        // Apply user-configured custom patterns
+        if !self.detection_rules.custom_patterns.is_empty() {
+            for record in records.iter() {
+                if let Some(proc_name) = &record.process_name {
+                    let proc_lower = proc_name.to_lowercase();
+                    for cp in &self.detection_rules.custom_patterns {
+                        if proc_lower.contains(&cp.pattern.to_lowercase()) {
+                            reasons.push(format!(
+                                "Custom pattern '{}' matched process '{}'",
+                                cp.name, proc_name
+                            ));
+                            confidence += cp.confidence_boost;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
         // Check for high resource usage (aggregate)
         if let Some(avg_util) = self.calculate_average_utilization(records) {
             if avg_util > self.detection_rules.max_utilization_pct {
@@ -706,45 +814,54 @@ impl RogueDetector {
         unusual_users.contains(&user.to_lowercase().as_str()) && !self.is_user_whitelisted(user)
     }
 
-    /// Determine risk level based on confidence
+    /// Determine risk level based on confidence using configured thresholds.
     fn determine_risk_level(&self, confidence: f32) -> RiskLevel {
-        match confidence {
-            c if c >= 0.9 => RiskLevel::Critical,
-            c if c >= 0.7 => RiskLevel::High,
-            c if c >= 0.5 => RiskLevel::Medium,
-            _ => RiskLevel::Low,
+        let t = &self.detection_rules.risk_thresholds;
+        if confidence >= t.critical {
+            RiskLevel::Critical
+        } else if confidence >= t.high {
+            RiskLevel::High
+        } else if confidence >= t.medium {
+            RiskLevel::Medium
+        } else {
+            RiskLevel::Low
         }
     }
 
-    /// Calculate overall risk score
+    /// Calculate overall risk score using configured threat weights.
     fn calculate_risk_score(
         &self,
         suspicious: &[SuspiciousProcess],
         miners: &[CryptoMiner],
         abusers: &[ResourceAbuser],
-        _exfiltrators: &[DataExfiltrator],
+        exfiltrators: &[DataExfiltrator],
     ) -> f32 {
+        let w = &self.detection_rules.threat_weights;
+        let t = &self.detection_rules.risk_thresholds;
         let mut score = 0.0;
 
-        // Weight different types of threats
         for process in suspicious {
-            score += match process.risk_level {
+            let level_weight = match process.risk_level {
                 RiskLevel::Critical => 1.0,
-                RiskLevel::High => 0.7,
-                RiskLevel::Medium => 0.4,
+                RiskLevel::High => t.high,
+                RiskLevel::Medium => t.medium,
                 RiskLevel::Low => 0.1,
             };
+            score += level_weight * w.suspicious_process;
         }
 
         for miner in miners {
-            score += miner.confidence * 0.8; // Crypto miners are high priority
+            score += miner.confidence * w.crypto_miner;
         }
 
         for abuser in abusers {
-            score += abuser.severity * 0.3; // Resource abuse is medium priority
+            score += abuser.severity * w.resource_abuser;
         }
 
-        // Normalize to 0-1 scale
+        for exfiltrator in exfiltrators {
+            score += exfiltrator.confidence * w.data_exfiltrator;
+        }
+
         (score / 10.0).min(1.0)
     }
 
