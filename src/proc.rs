@@ -6,7 +6,7 @@ use nix::sys::signal::{kill, Signal};
 #[cfg(unix)]
 use nix::unistd::Pid;
 // use std::process::Command; // Used conditionally below
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 use sysinfo::{Pid as SysPid, System};
 
 /// Process information for a running process
@@ -67,42 +67,53 @@ impl ProcessManager {
         self.nvml_api.is_process_using_gpu(pid)
     }
 
-    /// Gracefully terminate a process with timeout and escalation
+    /// Gracefully terminate a process with timeout and escalation.
+    ///
+    /// Captures the process start time before sending any signal, then verifies
+    /// on every poll that the PID still belongs to the same process (guards against
+    /// PID reuse races). Uses `Instant` for a monotonic timeout so system clock
+    /// adjustments cannot cause premature exit or runaway loops.
     #[cfg(unix)]
     pub fn graceful_kill(&mut self, pid: u32, timeout_secs: u16, force: bool) -> Result<()> {
-        let pid = Pid::from_raw(pid as i32);
+        let nix_pid = Pid::from_raw(pid as i32);
 
-        // First, try SIGTERM
+        // Snapshot the start time of the target process before sending any signal.
+        // If we cannot find it, it has already exited — nothing to do.
+        let original_start = self.get_process_start_secs(pid);
+        if original_start.is_none() {
+            tracing::info!("Process {} is already gone before SIGTERM", pid);
+            return Ok(());
+        }
+
         tracing::info!("Sending SIGTERM to process {}", pid);
-        kill(pid, Signal::SIGTERM).map_err(|e| anyhow::anyhow!("Failed to send SIGTERM: {}", e))?;
+        kill(nix_pid, Signal::SIGTERM)
+            .map_err(|e| anyhow::anyhow!("Failed to send SIGTERM: {}", e))?;
 
-        // Wait for the process to terminate
+        // Use Instant so the timeout is unaffected by wall-clock adjustments.
         let timeout = Duration::from_secs(timeout_secs as u64);
-        let start = SystemTime::now();
+        let deadline = Instant::now() + timeout;
 
-        while SystemTime::now().duration_since(start).unwrap_or_default() < timeout {
-            // Check if process still exists (with fresh data)
-            if !self.is_process_running(pid.as_raw() as u32)? {
+        while Instant::now() < deadline {
+            if !self.is_same_process_running(pid, original_start)? {
                 tracing::info!("Process {} terminated gracefully", pid);
                 return Ok(());
             }
-
             std::thread::sleep(Duration::from_millis(100));
         }
 
-        // Process didn't terminate, escalate if force is enabled
         if force {
             tracing::warn!("Process {} did not terminate, escalating to SIGKILL", pid);
-            kill(pid, Signal::SIGKILL)
+            kill(nix_pid, Signal::SIGKILL)
                 .map_err(|e| anyhow::anyhow!("Failed to send SIGKILL: {}", e))?;
 
-            // Wait a bit more for SIGKILL to take effect
             std::thread::sleep(Duration::from_millis(500));
 
-            if !self.is_process_running(pid.as_raw() as u32)? {
+            if !self.is_same_process_running(pid, original_start)? {
                 tracing::info!("Process {} terminated with SIGKILL", pid);
                 Ok(())
             } else {
+                // A zombie will never pass is_same_process_running (its status differs),
+                // but report clearly if somehow still present.
                 Err(anyhow::anyhow!(
                     "Process {} still running after SIGKILL",
                     pid
@@ -120,25 +131,53 @@ impl ProcessManager {
     /// Gracefully terminate a process with timeout and escalation (Windows stub)
     #[cfg(windows)]
     pub fn graceful_kill(&mut self, _pid: u32, _timeout_secs: u16, _force: bool) -> Result<()> {
-        // On Windows, we can't use Unix signals, so we'll use a different approach
-        // For now, just return an error indicating this feature isn't available on Windows
         Err(anyhow::anyhow!(
             "Process termination not yet implemented for Windows"
         ))
     }
 
-    /// Check if a process is still running
+    /// Return the start time (seconds since UNIX epoch) of the process at `pid`,
+    /// or `None` if the process does not exist or is a zombie.
+    fn get_process_start_secs(&mut self, pid: u32) -> Option<u64> {
+        let sys_pid = SysPid::from_u32(pid);
+        if !self.system.refresh_process(sys_pid) {
+            return None;
+        }
+        let proc = self.system.process(sys_pid)?;
+        // Treat zombies as gone — they have already released their resources.
+        #[cfg(unix)]
+        if proc.status() == sysinfo::ProcessStatus::Zombie {
+            return None;
+        }
+        Some(proc.start_time())
+    }
+
+    /// Check whether the process at `pid` is still the *same* process that was
+    /// originally targeted (identified by its start time).
     ///
-    /// Uses the return value of refresh_process: sysinfo does not remove dead
-    /// processes from its internal cache, so system.process(pid).is_some() can
-    /// still be true after a process has terminated. refresh_process returns true
-    /// only if the process was found and refreshed, false otherwise.
+    /// Returns `false` (meaning "the original process is gone") when:
+    /// - the PID no longer exists,
+    /// - the PID has been reused by a different process (different start time), or
+    /// - the process is a zombie (resources already released).
+    fn is_same_process_running(&mut self, pid: u32, original_start: Option<u64>) -> Result<bool> {
+        let current_start = self.get_process_start_secs(pid);
+        // If either is None, or the start times differ, the original process is gone.
+        Ok(current_start.is_some() && current_start == original_start)
+    }
+
+    /// Check if a process is still running (identity-unaware, kept for external callers).
+    ///
+    /// Prefers `is_same_process_running` internally; this variant is left for
+    /// `validate_process` and other callers that do not need start-time anchoring.
     fn is_process_running(&mut self, pid: u32) -> Result<bool> {
         let sys_pid = SysPid::from_u32(pid);
         Ok(self.system.refresh_process(sys_pid))
     }
 
-    /// Enrich GPU processes with system information
+    /// Enrich GPU processes with system information.
+    ///
+    /// Does a single `refresh_processes` up front, then looks up each PID in the
+    /// already-populated cache — O(N) instead of O(N·M).
     pub fn enrich_gpu_processes(
         &mut self,
         mut processes: Vec<crate::nvml_api::GpuProc>,
@@ -146,10 +185,15 @@ impl ProcessManager {
         self.system.refresh_processes();
 
         for process in &mut processes {
-            if let Ok(process_info) = self.get_process_info(process.pid) {
-                process.user = process_info.user;
-                process.proc_name = process_info.name;
-                process.start_time = parse_process_start_time(process_info.start_time);
+            let sys_pid = SysPid::from_u32(process.pid);
+            if let Some(proc) = self.system.process(sys_pid) {
+                process.proc_name = proc.name().to_string();
+                let start = SystemTime::UNIX_EPOCH + Duration::from_secs(proc.start_time());
+                process.start_time = parse_process_start_time(start);
+                // User resolution is best-effort; fall back to existing value on error.
+                if let Ok(user) = get_process_user(process.pid) {
+                    process.user = user;
+                }
             }
         }
 
