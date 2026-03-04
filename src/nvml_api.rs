@@ -62,6 +62,35 @@ pub struct NvmlApi {
     nvml: Nvml,
 }
 
+/// Shared sysinfo state for enriching GPU procs without redundant refreshes.
+struct SysinfoContext {
+    system: System,
+    users: Users,
+}
+
+impl SysinfoContext {
+    fn new() -> Self {
+        let mut system = System::new_all();
+        system.refresh_processes();
+        let users = Users::new_with_refreshed_list();
+        Self { system, users }
+    }
+
+    fn enrich(&self, proc: &mut GpuProc) {
+        let sys_pid = SysPid::from_u32(proc.pid);
+        if let Some(process) = self.system.process(sys_pid) {
+            proc.proc_name = process.name().to_string();
+            let start_time = SystemTime::UNIX_EPOCH + Duration::from_secs(process.start_time());
+            proc.start_time = crate::util::parse_process_start_time(start_time);
+            if let Some(user_id) = process.user_id() {
+                if let Some(user) = self.users.get_user_by_id(user_id) {
+                    proc.user = user.name().to_string();
+                }
+            }
+        }
+    }
+}
+
 #[allow(dead_code)]
 impl NvmlApi {
     /// Initialize NVML API
@@ -106,8 +135,8 @@ impl NvmlApi {
         })
     }
 
-    /// Get detailed GPU snapshot
-    pub fn get_gpu_snapshot(&self, index: u32) -> Result<GpuSnapshot> {
+    /// Get detailed GPU snapshot, enriching top_proc with a shared sysinfo context.
+    fn get_gpu_snapshot_with_ctx(&self, index: u32, ctx: &SysinfoContext) -> Result<GpuSnapshot> {
         let device = self
             .nvml
             .device_by_index(index)
@@ -124,33 +153,39 @@ impl NvmlApi {
             .map_err(map_nvml_error)
             .context("Failed to get memory info")?;
 
-        let utilization = device
-            .utilization_rates()
-            .map_err(map_nvml_error)
-            .context("Failed to get utilization rates")?;
+        let util_pct = match device.utilization_rates() {
+            Ok(u) => u.gpu as f32,
+            Err(NvmlError::NotSupported) => 0.0,
+            Err(e) => return Err(map_nvml_error(e)).context("Failed to get utilization rates"),
+        };
 
-        let temperature = device
-            .temperature(nvml_wrapper::enum_wrappers::device::TemperatureSensor::Gpu)
-            .map_err(map_nvml_error)
-            .context("Failed to get temperature")?;
+        let temp_c =
+            match device.temperature(nvml_wrapper::enum_wrappers::device::TemperatureSensor::Gpu) {
+                Ok(t) => t as i32,
+                Err(NvmlError::NotSupported) => 0,
+                Err(e) => return Err(map_nvml_error(e)).context("Failed to get temperature"),
+            };
 
-        let power_usage = device
-            .power_usage()
-            .map_err(map_nvml_error)
-            .context("Failed to get power usage")?;
+        let power_w = match device.power_usage() {
+            Ok(mw) => mw as f32 / 1000.0,
+            Err(NvmlError::NotSupported) => 0.0,
+            Err(e) => return Err(map_nvml_error(e)).context("Failed to get power usage"),
+        };
 
-        let ecc_volatile = None; // ECC errors not available in this version
+        let ecc_volatile = None;
 
-        let compute_processes = device
-            .running_compute_processes()
-            .map_err(map_nvml_error)
-            .context("Failed to get running compute processes")?;
-        let graphics_processes = match device.running_graphics_processes() {
-            Ok(processes) => processes,
+        let compute_processes = match device.running_compute_processes() {
+            Ok(p) => p,
             Err(NvmlError::NotSupported) => Vec::new(),
-            Err(error) => {
-                return Err(map_nvml_error(error))
-                    .context("Failed to get running graphics processes")
+            Err(e) => {
+                return Err(map_nvml_error(e)).context("Failed to get running compute processes")
+            }
+        };
+        let graphics_processes = match device.running_graphics_processes() {
+            Ok(p) => p,
+            Err(NvmlError::NotSupported) => Vec::new(),
+            Err(e) => {
+                return Err(map_nvml_error(e)).context("Failed to get running graphics processes")
             }
         };
         let processes = merge_nvml_processes(compute_processes, graphics_processes);
@@ -163,14 +198,14 @@ impl NvmlApi {
                 let mut proc = GpuProc {
                     gpu_index: index as u16,
                     pid: p.pid,
-                    user: "unknown".to_string(), // Will be filled by process info
-                    proc_name: "unknown".to_string(), // Will be filled by process info
+                    user: "unknown".to_string(),
+                    proc_name: "unknown".to_string(),
                     used_mem_mb: used_gpu_memory_mb(p),
-                    start_time: "unknown".to_string(), // Will be filled by process info
+                    start_time: "unknown".to_string(),
                     container: None,
                     node_id: None,
                 };
-                enrich_gpu_proc(&mut proc);
+                ctx.enrich(&mut proc);
                 proc
             });
 
@@ -180,31 +215,39 @@ impl NvmlApi {
             vendor: crate::vendor::GpuVendor::Nvidia,
             mem_used_mb: (mem_info.used / 1024 / 1024) as u32,
             mem_total_mb: (mem_info.total / 1024 / 1024) as u32,
-            util_pct: utilization.gpu as f32,
-            temp_c: temperature as i32,
-            power_w: power_usage as f32 / 1000.0, // Convert mW to W
+            util_pct,
+            temp_c,
+            power_w,
             ecc_volatile,
             pids: pids.len(),
             top_proc,
         })
     }
 
-    /// Get all GPU snapshots
+    /// Get detailed GPU snapshot
+    pub fn get_gpu_snapshot(&self, index: u32) -> Result<GpuSnapshot> {
+        let ctx = SysinfoContext::new();
+        self.get_gpu_snapshot_with_ctx(index, &ctx)
+    }
+
+    /// Get all GPU snapshots, sharing a single sysinfo context across all GPUs.
     pub fn get_all_snapshots(&self) -> Result<Vec<GpuSnapshot>> {
         let count = self.device_count()?;
+        let ctx = SysinfoContext::new();
         let mut snapshots = Vec::new();
 
         for i in 0..count {
-            let snapshot = self.get_gpu_snapshot(i)?;
+            let snapshot = self.get_gpu_snapshot_with_ctx(i, &ctx)?;
             snapshots.push(snapshot);
         }
 
         Ok(snapshots)
     }
 
-    /// Get processes using GPUs
+    /// Get all processes using GPUs, enriched with real name/user/start_time.
     pub fn get_gpu_processes(&self) -> Result<Vec<GpuProc>> {
         let count = self.device_count()?;
+        let ctx = SysinfoContext::new();
         let mut all_processes = Vec::new();
 
         for i in 0..count {
@@ -214,34 +257,40 @@ impl NvmlApi {
                 .map_err(map_nvml_error)
                 .with_context(|| format!("Failed to get device at index {}", i))?;
 
-            let compute_processes = device
-                .running_compute_processes()
-                .map_err(map_nvml_error)
-                .with_context(|| format!("Failed to get compute processes for GPU {}", i))?;
-            let graphics_processes = match device.running_graphics_processes() {
-                Ok(processes) => processes,
+            let compute_processes = match device.running_compute_processes() {
+                Ok(p) => p,
                 Err(NvmlError::NotSupported) => Vec::new(),
-                Err(error) => {
-                    return Err(map_nvml_error(error))
+                Err(e) => {
+                    return Err(map_nvml_error(e))
+                        .with_context(|| format!("Failed to get compute processes for GPU {}", i))
+                }
+            };
+            let graphics_processes = match device.running_graphics_processes() {
+                Ok(p) => p,
+                Err(NvmlError::NotSupported) => Vec::new(),
+                Err(e) => {
+                    return Err(map_nvml_error(e))
                         .with_context(|| format!("Failed to get graphics processes for GPU {}", i))
                 }
             };
             let processes = merge_nvml_processes(compute_processes, graphics_processes);
 
             for process in processes {
-                all_processes.push(GpuProc {
+                let mut proc = GpuProc {
                     gpu_index: i as u16,
                     pid: process.pid,
-                    user: "unknown".to_string(), // Will be filled by process info
-                    proc_name: "unknown".to_string(), // Will be filled by process info
+                    user: "unknown".to_string(),
+                    proc_name: "unknown".to_string(),
                     used_mem_mb: match process.used_gpu_memory {
                         UsedGpuMemory::Used(bytes) => (bytes / 1024 / 1024) as u32,
                         UsedGpuMemory::Unavailable => 0,
                     },
-                    start_time: "unknown".to_string(), // Will be filled by process info
+                    start_time: "unknown".to_string(),
                     container: None,
                     node_id: None,
-                });
+                };
+                ctx.enrich(&mut proc);
+                all_processes.push(proc);
             }
         }
 
@@ -337,24 +386,6 @@ fn used_gpu_memory_bytes(process: &ProcessInfo) -> u64 {
 
 fn used_gpu_memory_mb(process: &ProcessInfo) -> u32 {
     (used_gpu_memory_bytes(process) / 1024 / 1024) as u32
-}
-
-fn enrich_gpu_proc(proc: &mut GpuProc) {
-    let mut system = System::new_all();
-    system.refresh_processes();
-    let users = Users::new_with_refreshed_list();
-
-    let sys_pid = SysPid::from_u32(proc.pid);
-    if let Some(process) = system.process(sys_pid) {
-        proc.proc_name = process.name().to_string();
-        let start_time = SystemTime::UNIX_EPOCH + Duration::from_secs(process.start_time());
-        proc.start_time = crate::util::parse_process_start_time(start_time);
-        if let Some(user_id) = process.user_id() {
-            if let Some(user) = users.get_user_by_id(user_id) {
-                proc.user = user.name().to_string();
-            }
-        }
-    }
 }
 
 /// Map NVML errors to user-friendly messages
